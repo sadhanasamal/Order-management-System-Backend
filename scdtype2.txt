@@ -1,0 +1,239 @@
+"""
+Shared utilities for market_data service functions.
+"""
+from django.core.exceptions import PermissionDenied, ValidationError
+from django.db import transaction, IntegrityError
+from rest_framework import serializers
+
+from core.models import DataLock, PermissionType
+from core.services.access_control import AccessControlService
+from market_data.market_data_enums import MarketSubset
+
+
+def resolve_center_and_product(center_hub_id, product_hub_id):
+    """
+    Look up center and product by hub_id, validate both exist and center has a country.
+
+    Returns:
+        tuple: (center, product, country)
+
+    Raises:
+        ValidationError: If hub_ids are invalid or center has no associated country
+    """
+    from hospitals.models import Hospitals
+    from core.models import Product
+
+    center = Hospitals.objects.filter(center_hub_id=center_hub_id, is_active=True, is_deleted=False).first()
+    product = Product.objects.filter(product_hub_id=product_hub_id, is_active=True, is_deleted=False).first()
+
+    if not center or not product:
+        raise serializers.ValidationError("Invalid center_hub_id or product_hub_id")
+
+    if not center.country:
+        raise serializers.ValidationError(f"Center with hub_id {center_hub_id} has no associated country")
+
+    return center, product, center.country
+
+
+def validate_product_market_subset(product, market_subset, allow_empty=False):
+    """
+    Validate market_subset is compatible with the given product (Galafold/Pombiliti rules).
+
+    Args:
+        product: Product instance
+        market_subset: Market subset value to validate
+        allow_empty: If True, allows empty string as a valid value (used by CompetitorRecord)
+
+    Raises:
+        ValidationError: If market_subset is not valid for the product
+    """
+    product_name = product.name.upper()
+    extra = [''] if allow_empty else []
+
+    if product_name == 'GALAFOLD':
+        allowed = [MarketSubset.AMENABLE.value, MarketSubset.NON_AMENABLE.value, MarketSubset.NA.value] + extra
+        if market_subset not in allowed:
+            raise serializers.ValidationError({
+                'market_subset': f'For Galafold, only AMENABLE, NON_AMENABLE, or NA market subsets are allowed. {market_subset} is not valid.'
+            })
+    elif product_name == 'POMBILITI':
+        allowed = [MarketSubset.LOPD.value, MarketSubset.IOPD.value, MarketSubset.NA.value] + extra
+        if market_subset not in allowed:
+            raise serializers.ValidationError({
+                'market_subset': f'For Pombiliti, only LOPD, IOPD, or NA market subsets are allowed. {market_subset} is not valid.'
+            })
+
+
+def validate_with_old_context(*, old_context, new_values, new_country, new_center, new_product, form_model, exclude_id, exclude_model, validation_fn):
+    """
+    Calls validation_fn for the new context, then also validates the old context
+    if it has changed (different country, product, or time period).
+
+    This ensures that moving a record to a different context does not leave the
+    old context in an invalid state (e.g. treated total going out of bounds).
+
+    Args:
+        old_context: dict with keys center_hub_id, product_hub_id, month, year — populated
+                     inside resolve_new_values via the old_context closure dict pattern
+        new_values: dict of resolved new field values
+        new_country: resolved new Country instance
+        new_product: resolved new Product instance
+        exclude_id: old record's ID (passed through to validation to avoid double-counting)
+        exclude_model: model class to scope the exclusion
+        validation_fn: callable matching the validate_business_rules_for_* signature
+    """
+    # Validate new context
+    validation_fn(
+        country=new_country,
+        center=new_center,
+        product=new_product,
+        month=new_values['month'],
+        year=new_values['year'],
+        patient_count=new_values['patient_count'],
+        form_model=form_model,
+        exclude_id=exclude_id,
+        exclude_model=exclude_model,
+    )
+
+    # Validate old context if it changed — removing a record from the old context
+    # can push its treated total in the wrong direction (too high for discon/restart,
+    # potentially negative for initiation/non_start)
+    old_center, old_product, old_country = resolve_center_and_product(
+        old_context['center_hub_id'], old_context['product_hub_id']
+    )
+    if (
+        old_country.country_hub_id != new_country.country_hub_id or
+        old_center.center_hub_id != new_center.center_hub_id or
+        old_context['product_hub_id'] != new_values['product_hub_id'] or
+        old_context['month'] != new_values['month'] or
+        old_context['year'] != new_values['year']
+    ):
+        validation_fn(
+            country=old_country,
+            center=new_center,
+            product=old_product,
+            month=old_context['month'],
+            year=old_context['year'],
+            patient_count=0,
+            form_model=form_model,
+            exclude_id=exclude_id,
+            exclude_model=exclude_model,
+        )
+
+
+@transaction.atomic
+def scd2_center_update(*, model, record_id, user, update_data, resolve_new_values,
+                       validate_fn=None, build_create_kwargs, record_label):
+    """
+    Generic SCD Type 2 update for center-based market_data records.
+
+    Steps:
+    1.  select_for_update().get(id=record_id, is_deleted=False)
+    2.  resolve_center_and_product(old center/product)
+    3.  DataLock.check_data_lock for old record period
+    4.  resolve_new_values(old_record, update_data) → dict
+    5.  resolve_center_and_product(new center/product)
+    6.  DataLock.check_data_lock for new record period
+    7.  AccessControlService.check_access(user, old_record, EDIT)
+    8.  AccessControlService.check_access(user, new_center, EDIT)
+    9.  validate_fn(...) if provided
+    10. old_record.is_active = False; old_record.save()
+    11. model.objects.create(**build_create_kwargs(new_values), is_active=True, created_by=user)
+    """
+    # Step 1: Get existing record with row lock
+    try:
+        old_record = model.objects.select_for_update().get(id=record_id, is_deleted=False)
+    except model.DoesNotExist:
+        raise model.DoesNotExist(f"{record_label} record {record_id} not found")
+
+    # Step 2: Validate old center/product exist and have a country
+    resolve_center_and_product(old_record.center_hub_id, old_record.product_hub_id)
+
+    # Step 3: Validate data lock for old record
+    DataLock.check_data_lock(role=user.role.name, year=old_record.year, month=old_record.month)
+
+    # Step 4: Resolve new values
+    new_values = resolve_new_values(old_record, update_data)
+
+    # Step 5: Validate new center/product exist and have a country
+    new_center, new_product, new_country = resolve_center_and_product(
+        new_values['center_hub_id'], new_values['product_hub_id']
+    )
+
+    # Step 6: Validate data lock for new record
+    DataLock.check_data_lock(role=user.role.name, year=new_values['year'], month=new_values['month'])
+
+    # Step 7 & 8: Check ACL for both old and new records
+    if not AccessControlService.check_access(user, old_record, PermissionType.EDIT.value):
+        raise PermissionDenied("You don't have permission to update this record")
+
+    if not AccessControlService.check_access(user, new_center, PermissionType.EDIT.value):
+        raise PermissionDenied("You don't have permission to update this record")
+
+    # Step 9: Validate business rules with new values
+    if validate_fn:
+        validate_fn(
+            new_values=new_values, new_center=new_center,
+            new_product=new_product, new_country=new_country,
+            exclude_id=old_record.id,
+        )
+
+    # Step 10: Deactivate old record (SCD Type 2)
+    old_record.is_active = False
+    old_record.save()
+
+    # Step 11: Create new record with updated data (SCD Type 2)
+    try:
+        new_record = model.objects.create(
+            **build_create_kwargs(new_values),
+            is_active=True,
+            created_by=user,
+        )
+    except IntegrityError as e:
+        raise ValidationError(f"Unable to create {record_label} record: {str(e)}")
+
+    return new_record
+
+
+def soft_delete_center_record(*, model, record_id, user, record_label,
+                              validate_fn=None, use_system_permission=False):
+    """
+    Generic soft delete for center-based market_data records.
+
+    Steps:
+    1. model.objects.get(id=record_id, is_deleted=False)
+    2. resolve_center_and_product(record center/product)
+    3. DataLock.check_data_lock for record period
+    4. ACL check (system_permission or check_access DELETE)
+    5. validate_fn(record, country, product) if provided
+    6. record.is_deleted = True; record.save()
+    """
+    # Step 1: Get record
+    try:
+        record = model.objects.get(id=record_id, is_deleted=False)
+    except model.DoesNotExist:
+        raise model.DoesNotExist(f"{record_label} record {record_id} not found")
+
+    # Step 2: Validate center/product exist and have a country
+    center, product, country = resolve_center_and_product(record.center_hub_id, record.product_hub_id)
+
+    # Step 3: DataLock
+    DataLock.check_data_lock(role=user.role.name, year=record.year, month=record.month)
+
+    # Step 4: ACL check
+    if use_system_permission:
+        if not AccessControlService.has_system_permission(user):
+            raise PermissionDenied("You don't have permission to delete this record")
+    else:
+        if not AccessControlService.check_access(user, record, PermissionType.DELETE.value):
+            raise PermissionDenied("You don't have permission to delete this record")
+
+    # Step 5: Validate business rules
+    if validate_fn:
+        validate_fn(record=record, center=center, country=country, product=product)
+
+    # Step 6: Soft delete
+    record.is_deleted = True
+    record.save()
+
+    return record
