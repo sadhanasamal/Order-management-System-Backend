@@ -42,18 +42,19 @@ class SCDModel(BaseModel):
             ...
     """
 
-    hub_id = models.PositiveIntegerField(db_index=True, editable=False)
+    hub_id = models.PositiveIntegerField(db_index=True, editable=False, db_column='hub_id')
 
-    is_active = models.BooleanField(default=True, db_index=True)
-    is_deleted = models.BooleanField(default=False, db_index=True)
+    is_active = models.BooleanField(default=True, db_index=True, db_column='actv_ind')
+    is_deleted = models.BooleanField(default=False, db_index=True, db_column='del_ind')
 
-    deleted_at = models.DateTimeField(null=True, blank=True)
+    deleted_at = models.DateTimeField(null=True, blank=True, db_column='del_dt')
     deleted_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
         related_name='%(app_label)s_%(class)s_deleted',
+        db_column='del_by_id',
     )
 
     objects = SCDManager()
