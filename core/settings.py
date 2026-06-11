@@ -42,14 +42,18 @@ INSTALLED_APPS = [
     'rest_framework_simplejwt.token_blacklist',
     'user_management',
     'corsheaders',
+    'common',
+    'auditlog',
 ]
 
 MIDDLEWARE = [
+    'auditlog.middleware.AuditlogMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'common.middleware.current_user_middleware.CurrentUserMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'user_management.middleware.PageAccessMiddleware',
